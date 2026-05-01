@@ -65,6 +65,55 @@ Per-bit output: timestamp, bit value, field label (SOF, ID0–ID10, RTR, IDE, DL
 
 When a query window contains more than 8,000 samples, the API applies min-max bucket downsampling instead of stride decimation. Each bucket emits both its minimum and maximum sample in chronological order, so every rising and falling edge of the CAN signal is preserved in the rendered waveform regardless of zoom level.
 
+## Performance & Data Rates
+
+### Ingest throughput
+
+Each CANlogger capture machine sends one POST per 10 windows (batch). At 1 ms per window, 2 channels per bus:
+
+| Buses | Windows/s | POSTs/s received | Payload MB/s (typical 5× LZ4) |
+|---|---|---|---|
+| 1 | 2,000 | 200 | ~1.3 MB/s |
+| 5 | 10,000 | 1,000 | ~6.5 MB/s |
+
+The FastAPI ingest handler uses asyncpg `executemany` — each POST turns into one DB round-trip inserting up to 20 rows (10 windows × 2 channels). At 1,000 POSTs/s this is ~1,000 `executemany` calls/s.
+
+### TimescaleDB write rate
+
+| Metric | Value |
+|---|---|
+| Insert rows/s (5 buses, 2 ch) | **~10,000 rows/s** |
+| Bytes per row payload (BYTEA, typical) | ~300–650 bytes (LZ4-compressed) |
+| Write throughput to disk | **~3–6.5 MB/s** |
+| `synchronous_commit` | off (reduces write latency; no fsync per commit) |
+
+### Storage consumption
+
+Storage depends on CAN bus utilisation. LZ4-compressed BYTEA is stored as-is in chunks. TimescaleDB columnar compression (applied after 2 minutes) provides an additional **3–10×** reduction depending on signal pattern.
+
+| Stage | Per channel/s | Per bus (2 ch)/hr | 5 buses / 24 hr |
+|---|---|---|---|
+| LZ4 BYTEA (pre-TS compression) | 300–650 KB/s | 2–4.7 GB/hr | **240–560 GB** |
+| After TimescaleDB columnar compression (est. 5×) | 60–130 KB/s | 0.4–0.9 GB/hr | **50–110 GB** |
+
+The 24-hour retention policy enforced hourly means the steady-state database size is bounded to the above range. Actual size depends heavily on bus utilisation and signal diversity.
+
+### Query response time
+
+All `/query` calls fetch from a time-indexed hypertable. Typical response times over localhost:
+
+| Window | Sample count | Typical latency |
+|---|---|---|
+| 10 ms | ~15,630 raw (8,000 returned) | < 5 ms |
+| 100 ms | ~156,300 raw (8,000 returned) | < 15 ms |
+| 1 s | ~1.56 M raw (8,000 returned) | < 50 ms |
+
+The returned payload (JSON array of 8,000 float pairs, 2 channels) is approximately **180–220 KB uncompressed**. With HTTP gzip (`Accept-Encoding: gzip`) this compresses to **~45–60 KB**.
+
+### Decode endpoint
+
+`/decode` decompresses raw BYTEA, computes differential voltage (H−L), runs the phase-accumulator bit extractor, destuffer, CRC checker, and frame parser in pure NumPy/Python. Typical decode time for a 10 ms window (up to ~15 CAN frames at 125 kbps with 50 % utilisation): **15–50 ms** on a Geekom A6.
+
 ## Data Model
 
 ```sql
